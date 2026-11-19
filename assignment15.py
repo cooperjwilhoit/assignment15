@@ -70,12 +70,98 @@ class TwoDimReservoir(OneDimReservoir):
 
     def compute_transmissibility(self, i, j):
         """Return unconverted conductance for face neighbors; i == j uses x."""
-        raise NotImplementedError("Implement compute_transmissibility")
+        if i == j:
+            face_area = self.delta_y[i] * self.depth[i]
+            permeability = self.permeability[i]
+            if permeability == 0:
+                return 0.0
+            resistance = self.delta_x[i] / (
+                permeability * face_area)
+            return 1.0 / (
+                self.viscosity * self.formation_volume_factor * resistance)
+
+        if i < 0 or j < 0 or i >= self.N or j >= self.N:
+            raise ValueError('cell indices must be within the grid')
+
+        row_i, col_i = divmod(i, self.Nx)
+        row_j, col_j = divmod(j, self.Nx)
+        horizontal = row_i == row_j and abs(col_i - col_j) == 1
+        vertical = col_i == col_j and abs(row_i - row_j) == 1
+        if not (horizontal or vertical):
+            raise ValueError('transmissibility requires face-sharing neighbors')
+
+        if self.permeability[i] == 0 or self.permeability[j] == 0:
+            return 0.0
+
+        if horizontal:
+            face_i = self.delta_y[i] * self.depth[i]
+            face_j = self.delta_y[j] * self.depth[j]
+            resistance = (
+                self.delta_x[i] / (2 * self.permeability[i] * face_i)
+                + self.delta_x[j] / (2 * self.permeability[j] * face_j))
+        else:
+            face_i = self.delta_x[i] * self.depth[i]
+            face_j = self.delta_x[j] * self.depth[j]
+            resistance = (
+                self.delta_y[i] / (2 * self.permeability[i] * face_i)
+                + self.delta_y[j] / (2 * self.permeability[j] * face_j))
+
+        return 1.0 / (
+            self.viscosity * self.formation_volume_factor * resistance)
 
     def compute_accumulation(self, i):
         """Return cell storage without the transmissibility conversion factor."""
-        raise NotImplementedError("Implement compute_accumulation")
+        volume = self.area[i] * self.depth[i]
+        return (volume * self.porosity[i] * self.compressibility /
+                self.formation_volume_factor)
 
     def fill_matrices(self):
         """Assemble CSR T/B and source Q, counting each internal face once."""
-        raise NotImplementedError("Implement fill_matrices")
+        matrix = scipy.sparse.lil_matrix((self.N, self.N), dtype=float)
+        self.Q = np.zeros(self.N)
+
+        for i in range(self.N):
+            row, col = divmod(i, self.Nx)
+
+            if col < self.Nx - 1:
+                j = i + 1
+                conductance = self.conversion_factor * self.compute_transmissibility(i, j)
+                matrix[i, i] += conductance
+                matrix[j, j] += conductance
+                matrix[i, j] -= conductance
+                matrix[j, i] -= conductance
+
+            if row < self.Ny - 1:
+                j = i + self.Nx
+                conductance = self.conversion_factor * self.compute_transmissibility(i, j)
+                matrix[i, i] += conductance
+                matrix[j, j] += conductance
+                matrix[i, j] -= conductance
+                matrix[j, i] -= conductance
+
+        for side, i in (
+            ('left', [i for i in range(self.N) if i % self.Nx == 0]),
+            ('right', [i for i in range(self.N) if i % self.Nx == self.Nx - 1]),
+            ('bottom', [i for i in range(self.N) if i < self.Nx]),
+            ('top', [i for i in range(self.N) if i >= self.N - self.Nx]),
+        ):
+            boundary = self.inputs['boundary conditions'][side]
+            boundary_type = boundary['type']
+            boundary_value = boundary['value']
+
+            if boundary_type == 'prescribed pressure':
+                axis = 'x' if side in ('left', 'right') else 'y'
+                for cell in i:
+                    face = self.conversion_factor * self.boundary_transmissibility(cell, axis)
+                    matrix[cell, cell] += face
+                    self.Q[cell] += face * boundary_value
+            elif boundary_type == 'prescribed flux':
+                if boundary_value != 0:
+                    raise ValueError('only prescribed pressure and zero prescribed flux are supported')
+            else:
+                raise ValueError('only prescribed pressure and zero prescribed flux are supported')
+
+        self.T = matrix.tocsr()
+        self.B = scipy.sparse.diags(
+            [self.compute_accumulation(i) for i in range(self.N)],
+            format='csr')
